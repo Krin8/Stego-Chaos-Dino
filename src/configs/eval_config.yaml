@@ -1,9 +1,9 @@
 output_root: '../'
-pytorch_data_dir: '/datadrive/pytorch-data/'
-experiment_name: "cocostuff"
+pytorch_data_dir: '/content/drive/MyDrive/STEGO/src/pytorch_data_dir'
+experiment_name: "chaos"
 res: 320
 batch_size: 8
-num_workers: 24
+num_workers: 2
 run_picie: True
 run_crf: True
 run_prediction: True
@@ -11,9 +11,7 @@ dark_mode: True
 use_ddp: False
 
 model_paths:
-  - "../saved_models/cocostuff27_vit_base_5.ckpt"
-  #- "../saved_models/cityscapes_vit_base_1.ckpt"
-  #- "../saved_models/potsdam_test.ckpt"
+  - "/content/drive/MyDrive/STEGO/checkpoints/chaos/chaos_chaos_date_Apr13_15-33-24/epoch=1-step=900.ckpt"
 
 hydra:
   run:

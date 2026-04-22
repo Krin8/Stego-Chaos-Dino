@@ -4,9 +4,9 @@ from data import ContrastiveSegDataset
 import hydra
 import torch
 from omegaconf import DictConfig, OmegaConf
-from pytorch_lightning.utilities.seed import seed_everything
+from lightning.pytorch import seed_everything
 from torch.utils.data import DataLoader
-from torchvision.transforms.functional import five_crop, _get_image_size, crop
+from torchvision.transforms.functional import five_crop, get_image_size, crop
 from tqdm import tqdm
 from torch.utils.data import Dataset
 
@@ -102,14 +102,8 @@ class RandomCropComputer(Dataset):
             T.ToTensor(),
             ToTargetTensor(),
             cfg=cfg,
-            num_neighbors=cfg.num_neighbors,
-            pos_labels=False,
-            pos_images=False,
-            mask=False,
-            aug_geometric_transform=None,
-            aug_photometric_transform=None,
             extra_transform=cropper
-        )
+          )
 
     def __getitem__(self, item):
         batch = self.dataset[item]
@@ -127,7 +121,7 @@ class RandomCropComputer(Dataset):
         return len(self.dataset)
 
 
-@hydra.main(config_path="configs", config_name="train_config.yml")
+@hydra.main(config_path="configs", config_name="train_config.yaml")
 def my_app(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
     seed_everything(seed=0, workers=True)
@@ -137,7 +131,7 @@ def my_app(cfg: DictConfig) -> None:
     # crop_types = ["five","random"]
     # crop_ratios = [.5, .7]
 
-    dataset_names = ["cityscapes"]
+    dataset_names = ["chaos"]
     img_sets = ["train", "val"]
     crop_types = ["five"]
     crop_ratios = [.5]

@@ -1,35 +1,31 @@
 from modules import *
+from data import *   # <-- IMPORTANT (use your CHAOS dataset)
 import hydra
 import torch.multiprocessing
 from PIL import Image
 from crf import dense_crf
 from omegaconf import DictConfig, OmegaConf
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from train_segmentation import LitUnsupervisedSegmenter
 from tqdm import tqdm
-import random
+import torch.nn.functional as F
+import os
+from os.path import join
+
 torch.multiprocessing.set_sharing_strategy('file_system')
+from pytorch_lightning.callbacks import ModelCheckpoint
+import torch.serialization
 
+torch.serialization.add_safe_globals([ModelCheckpoint])
 
-class UnlabeledImageFolder(Dataset):
-    def __init__(self, root, transform):
-        super(UnlabeledImageFolder, self).__init__()
-        self.root = join(root)
-        self.transform = transform
-        self.images = os.listdir(self.root)
+from pytorch_lightning.callbacks import ModelCheckpoint
+from train_segmentation import LitUnsupervisedSegmenter
+import torch.serialization
 
-    def __getitem__(self, index):
-        image = Image.open(join(self.root, self.images[index])).convert('RGB')
-        seed = np.random.randint(2147483647)
-        random.seed(seed)
-        torch.manual_seed(seed)
-        image = self.transform(image)
-
-        return image, self.images[index]
-
-    def __len__(self):
-        return len(self.images)
-
+torch.serialization.add_safe_globals([
+    ModelCheckpoint,
+    LitUnsupervisedSegmenter
+])
 
 @hydra.main(config_path="configs", config_name="demo_config.yml")
 def my_app(cfg: DictConfig) -> None:
@@ -37,45 +33,91 @@ def my_app(cfg: DictConfig) -> None:
     os.makedirs(result_dir, exist_ok=True)
     os.makedirs(join(result_dir, "cluster"), exist_ok=True)
     os.makedirs(join(result_dir, "linear"), exist_ok=True)
+    os.makedirs(join(result_dir, "img"), exist_ok=True)
 
-    model = LitUnsupervisedSegmenter.load_from_checkpoint(cfg.model_path)
+    # Load model
+    model = LitUnsupervisedSegmenter.load_from_checkpoint(
+        cfg.model_path,
+        weights_only=False   # ⚠️ important
+    )    
     print(OmegaConf.to_yaml(model.cfg))
 
-    dataset = UnlabeledImageFolder(
-        root=cfg.image_dir,
+    # CHAOS Dataset (instead of UnlabeledImageFolder)
+    dataset = ContrastiveSegDataset(
+        pytorch_data_dir=cfg.pytorch_data_dir,
+        dataset_name="chaos",
+        crop_type=None,
+        image_set="val",   # or "all"
         transform=get_transform(cfg.res, False, "center"),
+        target_transform=get_transform(cfg.res, True, "center"),
+        cfg=model.cfg,
+        mask=True
     )
 
-    loader = DataLoader(dataset, cfg.batch_size * 2,
-                        shuffle=False, num_workers=cfg.num_workers,
-                        pin_memory=True, collate_fn=flexible_collate)
-
+    loader = DataLoader(
+        dataset,
+        cfg.batch_size * 2,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+        collate_fn=flexible_collate
+    )
+    print("Dataset size:", len(dataset))
     model.eval().cuda()
+
     if cfg.use_ddp:
         par_model = torch.nn.DataParallel(model.net)
     else:
         par_model = model.net
 
-    for i, (img, name) in enumerate(tqdm(loader)):
+    label_cmap = model.label_cmap
+
+    for i, batch in enumerate(tqdm(loader)):
         with torch.no_grad():
-            img = img.cuda()
+            img = batch["img"].cuda()
+            label = batch["label"]   # not used, but useful if needed
+
+            # ---- SAME LOGIC (unchanged) ----
             feats, code1 = par_model(img)
             feats, code2 = par_model(img.flip(dims=[3]))
             code = (code1 + code2.flip(dims=[3])) / 2
 
             code = F.interpolate(code, img.shape[-2:], mode='bilinear', align_corners=False)
 
-            linear_probs = torch.log_softmax(model.linear_probe(code), dim=1).cpu()
-            cluster_probs = model.cluster_probe(code, 2, log_probs=True).cpu()
+            # IMPORTANT FIX: use softmax (CRF expects probabilities)
+            linear_probs = torch.softmax(model.linear_probe(code), dim=1).cpu()
+            cluster_loss, cluster_probs = model.cluster_probe(code, None)
+            cluster_probs = torch.softmax(cluster_probs, dim=1).cpu()
+
+            # --------------------------------
 
             for j in range(img.shape[0]):
                 single_img = img[j].cpu()
+
                 linear_crf = dense_crf(single_img, linear_probs[j]).argmax(0)
                 cluster_crf = dense_crf(single_img, cluster_probs[j]).argmax(0)
 
-                new_name = ".".join(name[j].split(".")[:-1]) + ".png"
-                Image.fromarray(linear_crf.astype(np.uint8)).save(join(result_dir, "linear", new_name))
-                Image.fromarray(cluster_crf.astype(np.uint8)).save(join(result_dir, "cluster", new_name))
+                idx = i * loader.batch_size + j
+
+                # Save original image
+                plot_img = (prep_for_plot(single_img) * 255).numpy().astype(np.uint8)
+                Image.fromarray(plot_img).save(join(result_dir, "img", f"{idx}.jpg"))
+
+                # Save linear prediction (colored)
+                linear_color = label_cmap[linear_crf]
+                Image.fromarray(linear_color.astype(np.uint8)).save(
+                    join(result_dir, "linear", f"{idx}.png")
+                )
+
+                # Save cluster prediction (mapped + colored)
+                # mapped_cluster = model.test_cluster_metrics.map_clusters(
+                #     torch.from_numpy(cluster_crf)
+                # )
+
+                cluster_color = label_cmap[cluster_crf]
+                Image.fromarray(cluster_color.astype(np.uint8)).save(
+                    join(result_dir, "cluster", f"{idx}.png")
+                )
 
 
 if __name__ == "__main__":
