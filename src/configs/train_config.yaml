@@ -7,8 +7,8 @@ submitting_to_aml: False
 
 # Loader params
 num_workers: 2
-max_steps: 5000
-batch_size: 16
+max_steps: 10000
+batch_size: 8
 chaos_modality: "all"       # or "CT" or "T1DUAL" or "T2SPIR"
 chaos_n_classes: 5          # use 2 if CT only, 5 if MR or all
 
@@ -85,7 +85,7 @@ reset_probe_steps: ~
 n_images: 5
 scalar_log_freq: 10
 checkpoint_freq: 50
-val_freq: 100
+val_freq: 200
 hist_freq: 100
 
 

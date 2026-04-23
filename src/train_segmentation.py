@@ -229,9 +229,21 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         self.log('loss/total', loss, **log_args)
 
         self.manual_backward(loss)
+
+        # Gradient clipping for MONAI backbone stability
+        # (random init can produce large gradients early on)
+        if self.cfg.arch == "monai":
+            torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
+
         net_optim.step()
         cluster_probe_optim.step()
         linear_probe_optim.step()
+
+        # LR warmup for MONAI: linearly ramp up LR over first 500 steps
+        if self.cfg.arch == "monai" and self.global_step < 500:
+            warmup_factor = (self.global_step + 1) / 500.0
+            for pg in net_optim.param_groups:
+                pg['lr'] = pg['_initial_lr'] * warmup_factor
 
         if self.cfg.reset_probe_steps is not None and self.global_step == self.cfg.reset_probe_steps:
             print("RESETTING PROBES")
@@ -394,6 +406,12 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
                 main_param_groups = list(main_param_groups) + list(self.decoder.parameters())
 
         net_optim = torch.optim.Adam(main_param_groups, lr=self.cfg.lr)
+
+        # Store initial LR for warmup schedule
+        if self.cfg.arch == "monai":
+            for pg in net_optim.param_groups:
+                pg['_initial_lr'] = pg['lr']
+
         linear_probe_optim = torch.optim.Adam(list(self.linear_probe.parameters()), lr=5e-3)
         cluster_probe_optim = torch.optim.Adam(list(self.cluster_probe.parameters()), lr=5e-3)
 
