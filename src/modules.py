@@ -29,7 +29,8 @@ class DinoFeaturizer(nn.Module):
             num_classes=0)
         for p in self.model.parameters():
             p.requires_grad = False
-        self.model.eval().cuda()
+        device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+        self.model.eval().to(device)
         self.dropout = torch.nn.Dropout2d(p=.1)
 
         if arch == "vit_small" and patch_size == 16:
@@ -285,7 +286,8 @@ def tensor_correlation(a, b):
 
 
 def sample(t: torch.Tensor, coords: torch.Tensor):
-    return F.grid_sample(t, coords.permute(0, 2, 1, 3), padding_mode='border', align_corners=True)
+    pad_mode = 'zeros' if t.device.type == 'mps' else 'border'
+    return F.grid_sample(t, coords.permute(0, 2, 1, 3), padding_mode=pad_mode, align_corners=True)
 
 
 @torch.jit.script

@@ -5,7 +5,12 @@ from multiprocessing import Pool
 import hydra
 import seaborn as sns
 import torch.multiprocessing
-from crf import dense_crf
+try:
+    from crf import dense_crf
+except ImportError:
+    dense_crf = None
+import os
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -71,9 +76,10 @@ def my_app(cfg: DictConfig) -> None:
     for model_path in cfg.model_paths:
       
         torch.multiprocessing.set_sharing_strategy('file_system')
+        device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
         model = LitUnsupervisedSegmenter.load_from_checkpoint(
             model_path,
-            map_location="cuda",
+            map_location=device,
             weights_only=False
         )
         print(OmegaConf.to_yaml(model.cfg))
@@ -100,7 +106,8 @@ def my_app(cfg: DictConfig) -> None:
             collate_fn=flexible_collate
         )
 
-        model.eval().cuda()
+        device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+        model.eval().to(device)
 
         par_model = torch.nn.DataParallel(model.net) if cfg.use_ddp else model.net
 
@@ -110,8 +117,8 @@ def my_app(cfg: DictConfig) -> None:
             for i, batch in enumerate(tqdm(test_loader)):
 
                 with torch.no_grad():
-                    img = batch["img"].cuda()
-                    label = batch["label"].cuda()
+                    img = batch["img"].to(device)
+                    label = batch["label"].to(device)
 
                     # CHAOS-style forward (from Code 1)
                     feats, code1 = par_model(img)
@@ -135,9 +142,9 @@ def my_app(cfg: DictConfig) -> None:
                     cluster_loss, cluster_probs = model.cluster_probe(code, None)
                     cluster_probs = torch.log_softmax(cluster_probs, dim=1)
 
-                    if cfg.run_crf:
-                        linear_preds = batched_crf(pool, img, linear_probs).argmax(1).cuda()
-                        cluster_preds = batched_crf(pool, img, cluster_probs).argmax(1).cuda()
+                    if cfg.run_crf and dense_crf is not None:
+                        linear_preds = batched_crf(pool, img, linear_probs).argmax(1).to(device)
+                        cluster_preds = batched_crf(pool, img, cluster_probs).argmax(1).to(device)
                     else:
                         linear_preds = linear_probs.argmax(1)
                         cluster_preds = cluster_probs.argmax(1)

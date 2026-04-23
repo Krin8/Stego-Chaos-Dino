@@ -1,11 +1,33 @@
+import os
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+
 from utils import *
 from modules import *
 from data import *
 from torch.utils.data import DataLoader
+from torch.utils.data import WeightedRandomSampler
 import torch.nn.functional as F
 from datetime import datetime
 import hydra
 from omegaconf import DictConfig, OmegaConf
+
+# Monkey-patch for Hydra with Python 3.14+
+import sys
+import argparse
+from hydra._internal.utils import get_args_parser as _orig_get_args_parser
+_orig_add_argument = argparse.ArgumentParser.add_argument
+def _patched_add_argument(self, *args, **kwargs):
+    if kwargs.get('help') and type(kwargs['help']).__name__ == 'LazyCompletionHelp':
+        kwargs['help'] = 'Install or Uninstall shell completion'
+    return _orig_add_argument(self, *args, **kwargs)
+def _patched_get_args_parser():
+    argparse.ArgumentParser.add_argument = _patched_add_argument
+    try:
+        return _orig_get_args_parser()
+    finally:
+        argparse.ArgumentParser.add_argument = _orig_add_argument
+sys.modules["hydra.main"].get_args_parser = _patched_get_args_parser
+
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers import TensorBoardLogger
@@ -39,8 +61,9 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             dim = cfg.dim
 
         data_dir = join(cfg.output_root, "data")
+        device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
         if cfg.arch == "feature-pyramid":
-            cut_model = load_model(cfg.model_type, data_dir).cuda()
+            cut_model = load_model(cfg.model_type, data_dir).to(device)
             self.net = FeaturePyramidNet(cfg.granularity, cut_model, dim, cfg.continuous)
         elif cfg.arch == "dino":
             self.net = DinoFeaturizer(dim, cfg)
@@ -102,7 +125,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             img = batch["img"]
             # img_aug = batch["img_aug"]
             # coord_aug = batch["coord_aug"]
-            img_pos = batch["img_pos"]
+            img_pos = batch.get("img_pos_aug", batch["img_pos"])
             label = batch["label"]
             label_pos = batch["label_pos"]
 
@@ -385,9 +408,8 @@ def my_app(cfg: DictConfig) -> None:
         T.RandomResizedCrop(size=cfg.res, scale=(0.8, 1.0))
     ])
     photometric_transforms = T.Compose([
-        T.ColorJitter(brightness=.3, contrast=.3, saturation=.3, hue=.1),
-        T.RandomGrayscale(.2),
-        T.RandomApply([T.GaussianBlur((5, 5))])
+        T.ColorJitter(brightness=.3, contrast=.3, saturation=0, hue=0),
+        T.RandomApply([T.GaussianBlur((5, 5))], p=0.3),
     ])
 
     sys.stdout.flush()
@@ -424,7 +446,19 @@ def my_app(cfg: DictConfig) -> None:
         cfg=cfg,
     )
 
-    train_loader = DataLoader(train_dataset, cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, pin_memory=True)
+    # Weighted sampling: oversample slices with rare organ classes
+    # (kidneys, spleen) to balance the class distribution.
+    sample_weights = train_dataset.compute_sample_weights()
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(train_dataset),
+        replacement=True,
+    )
+    train_loader = DataLoader(
+        train_dataset, cfg.batch_size,
+        sampler=sampler,
+        num_workers=cfg.num_workers, pin_memory=True,
+    )
 
     if cfg.submitting_to_aml:
         val_batch_size = 16
@@ -441,13 +475,13 @@ def my_app(cfg: DictConfig) -> None:
     )
 
     if cfg.submitting_to_aml:
-        gpu_args = dict(accelerator='gpu', devices=1, val_check_interval=250)
+        gpu_args = dict(accelerator='auto', devices=1, val_check_interval=250)
 
         if gpu_args["val_check_interval"] > len(train_loader):
             gpu_args.pop("val_check_interval")
 
     else:
-        gpu_args = dict(accelerator='gpu', devices=1, val_check_interval=cfg.val_freq)
+        gpu_args = dict(accelerator='auto', devices=1, val_check_interval=cfg.val_freq)
 
         if gpu_args["val_check_interval"] > len(train_loader) // 4:
             gpu_args.pop("val_check_interval")

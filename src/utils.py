@@ -121,7 +121,8 @@ def load_model(model_type, data_dir):
         raise ValueError("No model: {} found".format(model_type))
 
     model.eval()
-    model.cuda()
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+    model.to(device)
     return model
 
 
@@ -156,11 +157,17 @@ def prep_args():
         if len(arg.split("=")) == 2:
             new_args.append(arg)
         elif arg.startswith("--"):
-            new_args.append(arg[2:] + "=" + old_args.pop(0))
+            if len(old_args) > 0 and not old_args[0].startswith("-"):
+                new_args.append(arg[2:] + "=" + old_args.pop(0))
+            else:
+                new_args.append(arg)
         else:
             raise ValueError("Unexpected arg style {}".format(arg))
     sys.argv = new_args
 
+
+def _identity(x):
+    return x
 
 def get_transform(res, is_label, crop_type):
     if crop_type == "center":
@@ -168,7 +175,7 @@ def get_transform(res, is_label, crop_type):
     elif crop_type == "random":
         cropper = T.RandomCrop(res)
     elif crop_type is None:
-        cropper = T.Lambda(lambda x: x)
+        cropper = T.Lambda(_identity)
         res = (res, res)
     else:
         raise ValueError("Unknown Cropper {}".format(crop_type))
@@ -177,7 +184,7 @@ def get_transform(res, is_label, crop_type):
                           cropper,
                           ToTargetTensor()])
     else:
-        return T.Compose([T.Resize(res, Image.NEAREST),
+        return T.Compose([T.Resize(res, Image.BILINEAR),
                           cropper,
                           T.ToTensor(),
                           normalize])

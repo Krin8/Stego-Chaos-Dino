@@ -5,9 +5,9 @@ from os.path import join
 import numpy as np
 import torch
 import torch.multiprocessing
-from PIL import Image
+from PIL import Image, ImageOps
 import pydicom
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
 
 
@@ -129,6 +129,16 @@ class CHAOS(Dataset):
             else:
                 self.samples = [s for s in self.samples if s[3] not in val_patients]
 
+        # Filter out pure-background slices from training to focus on
+        # informative samples and improve contrastive learning signal.
+        if image_set == "train":
+            before = len(self.samples)
+            self.samples = [s for s in self.samples
+                            if s[1] is not None and self._has_foreground(s[1], s[2])]
+            after = len(self.samples)
+            print(f"[CHAOS] Filtered empty BG slices: {before} → {after} "
+                  f"({before - after} removed)")
+
     # ------------------------------------------------------------------
     # Sample collection — exact paths from screenshots
     # ------------------------------------------------------------------
@@ -210,11 +220,37 @@ class CHAOS(Dataset):
     def _load_dicom_as_pil(dcm_path: str) -> Image.Image:
         dcm = pydicom.dcmread(dcm_path)
         arr = dcm.pixel_array.astype(np.float32)
-        arr -= arr.min()
-        if arr.max() > 0:
-            arr /= arr.max()
+
+        # Apply HU conversion for CT
+        if hasattr(dcm, 'RescaleSlope') and hasattr(dcm, 'RescaleIntercept'):
+            arr = arr * float(dcm.RescaleSlope) + float(dcm.RescaleIntercept)
+
+        # Modality-aware windowing
+        is_ct = hasattr(dcm, 'Modality') and dcm.Modality == 'CT'
+        if is_ct:
+            # Soft-tissue abdominal window optimized for liver/kidney/spleen.
+            # Standard clinical window: WC=50, WW=400 → HU range [-150, 250].
+            # Much tighter than p1/p99 (~2300 HU) which washes out organ contrast.
+            wc, ww = 50, 400
+            lo, hi = wc - ww / 2, wc + ww / 2
+        else:
+            # MRI: no HU scale, use per-image percentile normalization
+            lo, hi = np.percentile(arr, (1, 99))
+
+        arr = np.clip(arr, lo, hi)
+        if hi > lo:
+            arr = (arr - lo) / (hi - lo)
+        else:
+            arr = np.zeros_like(arr)
+
         arr = (arr * 255).astype(np.uint8)
-        return Image.fromarray(arr).convert("RGB")
+
+        # Apply CLAHE (histogram equalization) to boost local contrast.
+        # DINO was pre-trained on natural images with rich texture/contrast;
+        # raw DICOM→8-bit loses important local contrast that CLAHE restores.
+        img = Image.fromarray(arr, mode="L")
+        img = ImageOps.equalize(img)
+        return img.convert("RGB")
 
     # ------------------------------------------------------------------
     # Ground PNG → uint8 class-index PIL Image (mode "L")
@@ -230,6 +266,16 @@ class CHAOS(Dataset):
         for px, cls in lut.items():
             label[raw == px] = cls
         return Image.fromarray(label, mode="L")
+
+    @staticmethod
+    def _has_foreground(mask_path: str, modality: str) -> bool:
+        """Return True if the mask contains at least one foreground pixel."""
+        raw = np.array(Image.open(mask_path).convert("L"))
+        lut = _CT_PIXEL_TO_CLASS if modality == "CT" else _MRI_PIXEL_TO_CLASS
+        for px, cls in lut.items():
+            if cls > 0 and (raw == px).any():
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # Dataset interface
@@ -316,6 +362,7 @@ class ContrastiveSegDataset(Dataset):
 
         self.mask                      = mask
         self.extra_transform           = extra_transform
+        self.aug_geometric_transform   = aug_geometric_transform
         self.aug_photometric_transform = aug_photometric_transform
 
         modality  = getattr(cfg, "chaos_modality",  "all")
@@ -338,6 +385,46 @@ class ContrastiveSegDataset(Dataset):
         random.seed(seed)
         torch.manual_seed(seed)
 
+    def compute_sample_weights(self):
+        """Compute per-sample weights for WeightedRandomSampler.
+
+        Slices with rare organ classes get higher weight so that the
+        model sees a class-balanced distribution during training.
+        """
+        class_counts = np.zeros(self.n_classes, dtype=np.float64)
+        sample_class_presence = []
+
+        for dcm_path, mask_path, mod, pid in self.dataset.samples:
+            if mask_path is None or not os.path.exists(mask_path):
+                sample_class_presence.append(set())
+                continue
+            raw = np.array(Image.open(mask_path).convert("L"))
+            lut = _CT_PIXEL_TO_CLASS if mod == "CT" else _MRI_PIXEL_TO_CLASS
+            present = set()
+            for px, cls in lut.items():
+                if cls > 0 and (raw == px).any():
+                    present.add(cls)
+                    class_counts[cls] += 1
+            sample_class_presence.append(present)
+
+        # Inverse-frequency weights per class (background gets weight 1)
+        class_weights = np.ones(self.n_classes, dtype=np.float64)
+        for c in range(1, self.n_classes):
+            if class_counts[c] > 0:
+                class_weights[c] = 1.0 / class_counts[c]
+        # Normalize so max weight = 1
+        class_weights /= class_weights.max()
+
+        # Per-sample weight = max of the weights of classes present
+        weights = []
+        for present in sample_class_presence:
+            if not present:
+                weights.append(class_weights[0])
+            else:
+                weights.append(max(class_weights[c] for c in present))
+
+        return torch.tensor(weights, dtype=torch.float64)
+
     def __getitem__(self, ind):
         pack = self.dataset[ind]   # (img, label, valid_mask)
 
@@ -355,11 +442,19 @@ class ContrastiveSegDataset(Dataset):
         extra = self.extra_transform \
                 if self.extra_transform is not None else lambda i, x: x
 
+        # Apply geometric augmentation to img_pos so that contrastive
+        # learning gets a meaningfully different view of the same image.
+        # Previously img_pos was identical to img, producing trivial pairs.
+        if self.aug_geometric_transform is not None:
+            img_pos = self.aug_geometric_transform(pack[0])
+        else:
+            img_pos = pack[0].clone()
+
         ret = {
             "ind":       ind,
             "img":       extra(ind, pack[0]),
             "label":     extra(ind, pack[1]),
-            "img_pos":   extra(ind, pack[0]),
+            "img_pos":   extra(ind, img_pos),
             "label_pos": extra(ind, pack[1]),
             "coord":     coord,
         }
