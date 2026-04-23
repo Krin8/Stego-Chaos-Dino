@@ -67,8 +67,6 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             self.net = FeaturePyramidNet(cfg.granularity, cut_model, dim, cfg.continuous)
         elif cfg.arch == "dino":
             self.net = DinoFeaturizer(dim, cfg)
-        elif cfg.arch == "monai":
-            self.net = MonaiFeaturizer(dim, cfg)
         else:
             raise ValueError("Unknown arch {}".format(cfg.arch))
 
@@ -229,21 +227,9 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         self.log('loss/total', loss, **log_args)
 
         self.manual_backward(loss)
-
-        # Gradient clipping for MONAI backbone stability
-        # (random init can produce large gradients early on)
-        if self.cfg.arch == "monai":
-            torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
-
         net_optim.step()
         cluster_probe_optim.step()
         linear_probe_optim.step()
-
-        # LR warmup for MONAI: linearly ramp up LR over first 500 steps
-        if self.cfg.arch == "monai" and self.global_step < 500:
-            warmup_factor = (self.global_step + 1) / 500.0
-            for pg in net_optim.param_groups:
-                pg['lr'] = pg['_initial_lr'] * warmup_factor
 
         if self.cfg.reset_probe_steps is not None and self.global_step == self.cfg.reset_probe_steps:
             print("RESETTING PROBES")
@@ -383,35 +369,12 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             self.cluster_metrics.reset()
 
     def configure_optimizers(self):
-        if self.cfg.arch == "monai":
-            # MONAI backbone is trainable — use lower LR for backbone
-            # to prevent collapse in early training
-            backbone_params = list(self.net.model.parameters())
-            backbone_ids = {id(p) for p in backbone_params}
-            head_params = [p for p in self.net.parameters()
-                           if id(p) not in backbone_ids]
-            main_param_groups = [
-                {"params": backbone_params, "lr": self.cfg.lr * 0.1},
-                {"params": head_params, "lr": self.cfg.lr},
-            ]
-        else:
-            main_param_groups = list(self.net.parameters())
+        main_params = list(self.net.parameters())
 
         if self.cfg.rec_weight > 0:
-            if isinstance(main_param_groups, list) and len(main_param_groups) > 0 \
-               and isinstance(main_param_groups[0], dict):
-                main_param_groups.append(
-                    {"params": list(self.decoder.parameters()), "lr": self.cfg.lr})
-            else:
-                main_param_groups = list(main_param_groups) + list(self.decoder.parameters())
+            main_params.extend(self.decoder.parameters())
 
-        net_optim = torch.optim.Adam(main_param_groups, lr=self.cfg.lr)
-
-        # Store initial LR for warmup schedule
-        if self.cfg.arch == "monai":
-            for pg in net_optim.param_groups:
-                pg['_initial_lr'] = pg['lr']
-
+        net_optim = torch.optim.Adam(main_params, lr=self.cfg.lr)
         linear_probe_optim = torch.optim.Adam(list(self.linear_probe.parameters()), lr=5e-3)
         cluster_probe_optim = torch.optim.Adam(list(self.cluster_probe.parameters()), lr=5e-3)
 
