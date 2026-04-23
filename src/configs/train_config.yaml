@@ -30,12 +30,12 @@ extra_clusters: 0
 use_true_labels: False
 use_recalibrator: False
 model_type: "vit_small"
-arch: "dino"
+arch: "monai"
 use_fit_model: False
 dino_feat_type: "feat"
 projection_type: "nonlinear"
 #projection_type: linear
-dino_patch_size: 8
+dino_patch_size: 16
 granularity: 1
 continuous: True
 dim: 70

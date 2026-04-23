@@ -67,6 +67,8 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             self.net = FeaturePyramidNet(cfg.granularity, cut_model, dim, cfg.continuous)
         elif cfg.arch == "dino":
             self.net = DinoFeaturizer(dim, cfg)
+        elif cfg.arch == "monai":
+            self.net = MonaiFeaturizer(dim, cfg)
         else:
             raise ValueError("Unknown arch {}".format(cfg.arch))
 
@@ -369,12 +371,29 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             self.cluster_metrics.reset()
 
     def configure_optimizers(self):
-        main_params = list(self.net.parameters())
+        if self.cfg.arch == "monai":
+            # MONAI backbone is trainable — use lower LR for backbone
+            # to prevent collapse in early training
+            backbone_params = list(self.net.model.parameters())
+            backbone_ids = {id(p) for p in backbone_params}
+            head_params = [p for p in self.net.parameters()
+                           if id(p) not in backbone_ids]
+            main_param_groups = [
+                {"params": backbone_params, "lr": self.cfg.lr * 0.1},
+                {"params": head_params, "lr": self.cfg.lr},
+            ]
+        else:
+            main_param_groups = list(self.net.parameters())
 
         if self.cfg.rec_weight > 0:
-            main_params.extend(self.decoder.parameters())
+            if isinstance(main_param_groups, list) and len(main_param_groups) > 0 \
+               and isinstance(main_param_groups[0], dict):
+                main_param_groups.append(
+                    {"params": list(self.decoder.parameters()), "lr": self.cfg.lr})
+            else:
+                main_param_groups = list(main_param_groups) + list(self.decoder.parameters())
 
-        net_optim = torch.optim.Adam(main_params, lr=self.cfg.lr)
+        net_optim = torch.optim.Adam(main_param_groups, lr=self.cfg.lr)
         linear_probe_optim = torch.optim.Adam(list(self.linear_probe.parameters()), lr=5e-3)
         cluster_probe_optim = torch.optim.Adam(list(self.cluster_probe.parameters()), lr=5e-3)
 
